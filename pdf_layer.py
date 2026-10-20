@@ -50,8 +50,10 @@ class GlyphLessFont:
     each run to the detected geometry.
     """
     units = 1000
-    ascender = 0.88
-    descender = -0.12
+    # A tall em cell (1.25 em) like common CJK fonts. With a compact cell,
+    # poppler's layout analysis read ruled tables column by column.
+    ascender = 1.0
+    descender = -0.25
 
     @staticmethod
     def width(char):

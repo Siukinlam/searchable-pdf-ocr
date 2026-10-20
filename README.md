@@ -24,14 +24,15 @@ and selecting then hit the right glyphs without losing recognition accuracy.
 ## Benchmark
 
 30 generated pages (paragraphs, bilingual, tables, ±1.5° skew, 120 dpi), all
-engines on one aarch64 server. Full method, per-group numbers and a harder
-private corpus are in [docs/BENCHMARK.md](docs/BENCHMARK.md).
+engines on one aarch64 server. Full method, per-group numbers, a comparison
+with the v0.1.0 writer and a harder private corpus are in
+[docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 | Engine | Recognize (s/page) | CER | Characters placed on their glyph | Median center error |
 |---|---:|---:|---:|---:|
-| `unlimited` (1 GPU, vLLM) | 7.33 | 0.1% | 11.0% | 48.8 pt |
-| `rapidocr` (4 CPU cores) | 2.07 | 0.3% | 98.5% | 0.97 pt |
-| `hybrid` | 7.34 | 0.1% | 98.6% | 0.96 pt |
+| `unlimited` (1 GPU, vLLM) | 6.64 | 2.1% (mostly order; bag F1 0.999) | 11.8% | 42.7 pt |
+| `rapidocr` (4 CPU cores) | 1.80 | 0.3% | 97.4% | 1.09 pt |
+| `hybrid` | 6.65 | 0.1% | 97.7% | 1.08 pt |
 
 On harder real-world documents the gap in recognition is larger. CER was 4.3%
 for `unlimited` and `hybrid` vs 7.0% for `rapidocr`, mostly from Traditional
@@ -42,11 +43,16 @@ Chinese variant forms. Validate on your own documents.
 1. `POST /v1/ocr` accepts raw PDF bytes and returns an opaque job ID.
 2. A bounded child process renders each page without a text layer at 200 dpi
    and sends it to the selected engine.
-3. Recognized text is written with PDF render mode 3 (invisible) by an
-   **incremental save**. Images, metadata, bookmarks and annotations are kept,
-   and pages that already contain text are skipped.
-4. The result is reopened and verified: page counts, extracted text equal to
-   the recognized text, and source bytes as prefix. Then it can be downloaded.
+3. Recognized text is written with [PDFium](https://pdfium.googlesource.com/pdfium/)
+   (through [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)) as
+   invisible text (render mode 3), then saved incrementally:
+   - The font is generated per document, with one glyph per recognized
+     character and a Unicode map, typically a few kilobytes.
+   - Images, metadata, bookmarks and annotations are kept.
+   - Pages that already contain text are skipped.
+4. The result is reopened and verified, then it can be downloaded. The checks
+   are: page counts, every recognized character extractable exactly once, and
+   the source bytes kept as the prefix.
 
 ### Text-layer placement
 
@@ -211,8 +217,12 @@ python -m pytest -q tests
   authentication, limits, cancellation, timeouts and TTL.
 - With the RapidOCR packages installed, the same synthetic scans also run
   through the real local model.
-- `python live_smoke.py --output DIR` runs one synthetic page against a real
-  Unlimited-OCR endpoint.
+- With poppler installed, the text layer is also checked with `pdftotext`.
+- Test PDFs are written by a small built-in writer (`tests/pdfgen.py`). Scans
+  are drawn with a subset of Droid Sans Fallback (Apache-2.0) in
+  `tests/fixtures`.
+- `python live_smoke.py --output DIR` runs one synthetic page against the
+  engine selected by `OCR_ENGINE`.
 
 ## Limitations
 
@@ -221,25 +231,36 @@ python -m pytest -q tests
   comes out row by row.
 - Handwriting, faded print and real vertical documents have not been
   benchmarked.
-- The text layer embeds the full Droid Sans Fallback CJK font, about 3.4 MB per
-  document.
-- Only searchability in PyMuPDF is verified. Check your PDF viewer.
+- **Output size:** PDFium's incremental save rewrites the objects of every
+  page it modifies, including the page image. A fully scanned document roughly
+  doubles in size, and its original bytes stay intact as the prefix.
+- **Characters outside the Basic Multilingual Plane** (emoji, CJK extension
+  B and beyond) are rejected with `unsupported_ocr_glyph`.
+- **Viewers:** extraction, search and pixel identity are verified with PDFium
+  and poppler (`pdftotext`, `pdftoppm`). Check your own PDF viewer.
 
 ## License
 
-AGPL-3.0-only, because the service links [PyMuPDF](https://pymupdf.readthedocs.io/)
-(AGPL-3.0 or Artifex commercial). Writing the text layer with pikepdf and
-rendering pages with pypdfium2 would remove the AGPL dependency; that is
-feasible but not implemented.
+Apache-2.0 from version 0.2.0; see `LICENSE` and `NOTICE`. Version 0.1.0 used
+PyMuPDF and was released under AGPL-3.0. That release remains available under
+that license.
 
-Third-party components:
+Runtime dependencies and their licenses:
 
 | Component | License |
 |---|---|
-| RapidOCR | Apache-2.0 |
-| PaddleOCR models | Apache-2.0 |
-| ONNX Runtime | MIT |
-| OpenCV (headless) | Apache-2.0 |
-| Baidu Unlimited-OCR | MIT |
+| pypdfium2 / PDFium | BSD-3-Clause / Apache-2.0. Bundles FreeType (FTL), libjpeg-turbo, OpenJPEG, Little CMS, libpng, zlib, ICU and Abseil, all permissive |
+| fontTools | MIT |
+| Pillow | MIT-CMU |
 | FastAPI | MIT |
+| uvicorn | BSD-3-Clause |
 | httpx | BSD-3-Clause |
+| RapidOCR (optional) | Apache-2.0 |
+| PaddleOCR models (optional) | Apache-2.0 |
+| ONNX Runtime (optional) | MIT |
+| OpenCV headless (optional) | Apache-2.0 |
+| Baidu Unlimited-OCR (remote model) | MIT |
+
+The full installed set was audited with `pip-licenses`. No GPL or AGPL
+package is required. The only copyleft is MPL-2.0 in certifi and tqdm, which
+are installed unmodified.

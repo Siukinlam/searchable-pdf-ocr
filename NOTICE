@@ -1,0 +1,26 @@
+searchable-pdf-ocr
+Copyright 2026 The searchable-pdf-ocr authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE),
+starting with version 0.2.0. Version 0.1.0 was released under the GNU Affero
+General Public License v3.0 and remains available under that license.
+
+Bundled third-party material
+----------------------------
+
+tests/fixtures/DroidSansFallback-subset.ttf
+  A subset of Droid Sans Fallback, used only to draw synthetic test scans.
+  Copyright (c) 2005-2008, The Android Open Source Project.
+  Licensed under the Apache License, Version 2.0.
+  Source and checksum: tests/fixtures/README.md
+
+Runtime dependencies (installed separately, not bundled)
+--------------------------------------------------------
+
+pypdfium2 (BSD-3-Clause / Apache-2.0) ships a PDFium build that includes
+FreeType (FreeType Project License), libjpeg-turbo (IJG / BSD-3-Clause),
+OpenJPEG (BSD-2-Clause), Little CMS (MIT), libpng, zlib, ICU (Unicode),
+Abseil (Apache-2.0) and Anti-Grain Geometry 2.3; see its license files.
+
+The invisible-text font is generated at runtime by pdf_layer.GlyphLessFont
+with fontTools (MIT); no font program is shipped for it.
