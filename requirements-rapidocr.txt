@@ -1,0 +1,4 @@
+# Optional OCR_ENGINE=rapidocr backend (Apache-2.0). The rapidocr wheel bundles
+# the PP-OCRv6 small det/rec and mobile cls ONNX models used by default.
+rapidocr==3.10.0
+onnxruntime==1.23.2
