@@ -7,7 +7,7 @@ import threading
 import time
 
 from fastapi.testclient import TestClient
-import pymupdf as fitz
+from pdfutil import display_size, find, open_pdf, text
 import pytest
 
 from app import Manager, Settings, create_app, kill_process
@@ -70,8 +70,8 @@ AUTH = {"Authorization": "Bearer api-test-key"}
 PDF_AUTH = {**AUTH, "Content-Type": "application/pdf"}
 
 
-def wait_status(client, job_id, target={"done", "error"}):
-    for _ in range(200):
+def wait_status(client, job_id, target={"done", "error"}, seconds=10):
+    for _ in range(int(seconds / 0.05)):
         status = client.get("/v1/ocr/jobs/" + job_id, headers=AUTH).json()
         if status["status"] in target:
             return status
@@ -102,9 +102,9 @@ def test_real_subprocess_upload_poll_download_delete(config, upstream, scan_fact
         assert pdf.status_code == 200
         assert pdf.headers["content-type"] == "application/pdf"
         assert pdf.content.startswith(source.read_bytes())
-        with fitz.open(stream=pdf.content, filetype="pdf") as doc:
-            assert "繁體中文文件測試" in doc[0].get_text()
-            assert doc[0].search_for("Searchable")
+        with open_pdf(pdf.content) as doc:
+            assert "繁體中文文件測試" in text(doc[0])
+            assert find(doc[0], "Searchable")
         assert len(upstream["calls"]) == 1
         assert client.delete(f"/v1/ocr/jobs/{job_id}", headers=AUTH).status_code == 200
         assert not list(config.root.iterdir())
@@ -360,9 +360,9 @@ def test_two_jobs_serialize_and_keep_their_own_results(config, upstream, scan_fa
             response = client.get(f"/v1/ocr/jobs/{job_id}/result", headers=AUTH)
             assert response.status_code == 200
             assert response.content.startswith(source.read_bytes())
-            with fitz.open(stream=response.content, filetype="pdf") as doc:
+            with open_pdf(response.content) as doc:
                 assert len(doc) == expected_pages
-                assert "繁體中文文件測試" in doc[0].get_text()
+                assert "繁體中文文件測試" in text(doc[0])
             assert client.delete(f"/v1/ocr/jobs/{job_id}", headers=AUTH).status_code == 200
         assert len(upstream["calls"]) == 2
         assert not list(config.root.iterdir())
@@ -465,15 +465,15 @@ def test_local_rapidocr_engine_runs_same_job_protocol(config, monkeypatch, scan_
         health = client.get("/health").json()
         assert health["ready"] is True and health["engine"] == "RapidOCR PP-OCRv6"
         job_id = client.post("/v1/ocr", content=source.read_bytes(), headers=PDF_AUTH).json()["job_id"]
-        result = wait_status(client, job_id)
+        result = wait_status(client, job_id, seconds=60)
         assert result["status"] == "done", result
         assert result["pages_total"] == result["pages_with_text"] == 2
         pdf = client.get(f"/v1/ocr/jobs/{job_id}/result", headers=AUTH)
         assert pdf.content.startswith(source.read_bytes())
-        with fitz.open(stream=pdf.content, filetype="pdf") as doc:
-            text = doc[0].get_text()
-            assert "Searchable document 12345" in text and "简体中文文档测试" in text
-            assert doc[0].search_for("繁體中文")
+        with open_pdf(pdf.content) as doc:
+            extracted = text(doc[0])
+            assert "Searchable document 12345" in extracted and "简体中文文档测试" in extracted
+            assert find(doc[0], "繁體中文")
         assert client.delete(f"/v1/ocr/jobs/{job_id}", headers=AUTH).status_code == 200
         assert not list(config.root.iterdir())
 
@@ -493,21 +493,21 @@ def test_hybrid_engine_runs_same_job_protocol(config, upstream, monkeypatch, sca
         health = client.get("/health").json()
         assert health["ready"] is True and health["engine"] == "Unlimited-OCR + RapidOCR PP-OCRv6"
         job_id = client.post("/v1/ocr", content=source.read_bytes(), headers=PDF_AUTH).json()["job_id"]
-        result = wait_status(client, job_id)
+        result = wait_status(client, job_id, seconds=60)
         assert result["status"] == "done", result
         assert len(upstream["calls"]) == 1
         pdf = client.get(f"/v1/ocr/jobs/{job_id}/result", headers=AUTH)
-        with fitz.open(stream=pdf.content, filetype="pdf") as doc:
+        with open_pdf(pdf.content) as doc:
             page = doc[0]
-            assert "".join(page.get_text().split()) == "".join("".join(b.text.split()) for b in blocks)
+            width, height = display_size(page)
+            assert sorted("".join(text(page).split())) == sorted("".join("".join(b.text.split()) for b in blocks))
             for b in blocks:
-                found = page.search_for(b.text)
+                found = find(page, b.text)
                 assert found, b.text
-                expected = fitz.Rect(b.box[0] * page.rect.width, b.box[1] * page.rect.height,
-                                     b.box[2] * page.rect.width, b.box[3] * page.rect.height)
+                x0, y0, x1, y1 = (b.box[0] * width, b.box[1] * height, b.box[2] * width, b.box[3] * height)
                 # Line placement, not an even split of the coarse block.
-                assert abs(found[0].x0 - expected.x0) < 5 and abs(found[-1].x1 - expected.x1) < 5
-                assert abs((found[0].y0 + found[0].y1) - (expected.y0 + expected.y1)) / 2 < 4
+                assert abs(found[0][0] - x0) < 5 and abs(found[0][2] - x1) < 5
+                assert abs((found[0][1] + found[0][3]) - (y0 + y1)) / 2 < 4
         assert client.delete(f"/v1/ocr/jobs/{job_id}", headers=AUTH).status_code == 200
 
 

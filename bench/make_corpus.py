@@ -1,8 +1,9 @@
 """Generate a reproducible synthetic scan corpus with exact ground truth.
 
-Each page is first laid out as a native PDF text page (the reference text and
-character boxes), then rasterized to an image-only single-page PDF the OCR
-engines see. All text is fictional and written for this benchmark.
+Each page is drawn directly as an image with Pillow; every character's box is
+recorded from the font's advances, ascent and descent (as an extractor reports
+it) and the image is wrapped in an image-only single-page PDF the OCR engines
+see. All text is fictional and written for this benchmark.
 
     python bench/make_corpus.py OUT_DIR [--cjk-font PATH] [--cjk-index N]
 
@@ -15,9 +16,9 @@ import json
 import math
 import random
 from pathlib import Path
+import sys
 
-import pymupdf as fitz
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 CJK_CANDIDATES = [
     ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc", 2),   # Noto Serif CJK TC
@@ -72,7 +73,7 @@ def find_font(path, index):
 
 
 def load_face(path, index):
-    """Font bytes; PyMuPDF cannot pick a face inside a .ttc collection."""
+    """Font bytes of one face; .ttc/.otc collections are split with fontTools."""
     if not path.lower().endswith((".ttc", ".otc")):
         return Path(path).read_bytes()
     from fontTools.ttLib import TTCollection
@@ -81,10 +82,52 @@ def load_face(path, index):
     return buffer.getvalue()
 
 
-def wrap(text, font, size, width):
+PAGE_W, PAGE_H = 595.28, 841.89
+
+
+class Page:
+    """One page drawn at dpi; positions are in points from the top-left."""
+
+    def __init__(self, face, dpi):
+        self.dpi, self.zoom = dpi, dpi / 72
+        self.image = Image.new("L", (round(PAGE_W * self.zoom), round(PAGE_H * self.zoom)), 255)
+        self.draw = ImageDraw.Draw(self.image)
+        self.face, self.fonts, self.chars = face, {}, []
+        self.y = 72
+
+    def font(self, size):
+        if size not in self.fonts:
+            self.fonts[size] = ImageFont.truetype(io.BytesIO(self.face), round(size * self.zoom))
+        return self.fonts[size]
+
+    def width(self, s, size):
+        return self.font(size).getlength(s) / self.zoom
+
+    def text(self, x, y, s, size=11):
+        font, z = self.font(size), self.zoom
+        self.draw.text((x * z, y * z), s, font=font, fill=0, anchor="ls")
+        ascent, descent = font.getmetrics()
+        for k, ch in enumerate(s):
+            if ch.isspace():
+                continue
+            x0 = x + font.getlength(s[:k]) / z
+            self.chars.append((ch, (x0, y - ascent / z, x0 + font.getlength(ch) / z, y + descent / z)))
+
+    def line(self, x0, y0, x1, y1):
+        z = self.zoom
+        self.draw.line((x0 * z, y0 * z, x1 * z, y1 * z), fill=77, width=max(1, round(0.6 * z)))
+
+    def paragraph(self, s, size=11, indent=0, leading=1.6):
+        for row in wrap(s, lambda t: self.width(t, size), PAGE_W - 144 - indent):
+            self.y += size * leading
+            self.text(72 + indent, self.y, row, size)
+        self.y += size * 0.6
+
+
+def wrap(text, measure, width):
     lines, current = [], ""
     for ch in text:
-        if current and font.text_length(current + ch, fontsize=size) > width:
+        if current and measure(current + ch) > width:
             # Keep Latin words whole where possible.
             if ch != " " and " " in current and current[-1] != " " and ord(ch) < 0x3000:
                 head, _, tail = current.rpartition(" ")
@@ -100,33 +143,13 @@ def wrap(text, font, size, width):
     return lines
 
 
-class Page:
-    def __init__(self, doc, fonts):
-        self.page = doc.new_page(width=595.28, height=841.89)
-        self.fonts = fonts
-        for name, font in fonts.items():
-            self.page.insert_font(fontname=name, fontbuffer=font.buffer)
-        self.y = 72
-
-    def text(self, x, y, s, name="cjk", size=11):
-        self.page.insert_text((x, y), s, fontname=name, fontsize=size)
-
-    def paragraph(self, s, name="cjk", size=11, indent=0, leading=1.6):
-        font = self.fonts[name]
-        for line in wrap(s, font, size, 595.28 - 144 - indent):
-            self.y += size * leading
-            self.text(72 + indent, self.y, line, name, size)
-        self.y += size * 0.6
-
-
-def build(kind, number, rng, fonts):
-    doc = fitz.open()
-    p = Page(doc, fonts)
-    p.text(72, 48, f"河濱社區圖書館年報 — Riverside Community Library Annual Report", "cjk", 8)
+def build(kind, number, rng, face):
+    p = Page(face, 120 if kind == "lowres" else 150)
+    p.text(72, 48, "河濱社區圖書館年報 — Riverside Community Library Annual Report", 8)
     if kind in ("para", "skew", "lowres"):
         for section in rng.sample(range(len(HEADINGS)), 3):
             p.y += 10
-            p.text(72, p.y + 14, HEADINGS[section], "cjk", 14)
+            p.text(72, p.y + 14, HEADINGS[section], 14)
             p.y += 20
             for k in range(rng.randint(2, 3)):
                 p.paragraph(f"{section + 1}.{k + 1}　" +
@@ -134,9 +157,9 @@ def build(kind, number, rng, fonts):
     elif kind == "bilingual":
         for _ in range(4):
             p.paragraph("".join(rng.sample(TC, 2)), size=11)
-            p.paragraph(" ".join(rng.sample(EN, 2)), name="tiro", size=11)
+            p.paragraph(" ".join(rng.sample(EN, 2)), size=11)
     elif kind == "table":
-        p.text(72, 90, "表一：分館服務統計 Table 1: Branch statistics", "cjk", 13)
+        p.text(72, 90, "表一：分館服務統計 Table 1: Branch statistics", 13)
         cols = [72, 200, 290, 380, 470, 523]
         head = ["分館 Branch", "借閱量", "訪客", "活動", "備註"]
         rows = [head] + [[f"第{n}分館", f"{rng.randint(1000, 99999):,}", f"{rng.randint(100, 9999):,}",
@@ -144,42 +167,34 @@ def build(kind, number, rng, fonts):
                          for n in range(1, 15)]
         y = 110
         for r in rows:
-            p.page.draw_rect(fitz.Rect(cols[0], y, cols[-1], y + 26), color=(0.3, 0.3, 0.3), width=0.6)
-            for c in cols[1:-1]:
-                p.page.draw_line((c, y), (c, y + 26), color=(0.3, 0.3, 0.3), width=0.6)
+            p.line(cols[0], y, cols[-1], y)
+            p.line(cols[0], y + 26, cols[-1], y + 26)
+            for c in cols:
+                p.line(c, y, c, y + 26)
             for x, cell in zip(cols, r):
-                p.text(x + 5, y + 17, cell, "cjk", 10)
+                p.text(x + 5, y + 17, cell, 10)
             y += 26
         p.y = y + 10
         p.paragraph("".join(rng.sample(TC, 2)), size=11)
-    p.text(72, 815, f"本文件為基準測試用虛構樣本　第 {number} 頁", "cjk", 8)
-    return doc
+    p.text(72, 815, f"本文件為基準測試用虛構樣本　第 {number} 頁", 8)
+    return p
 
 
-def rasterize(doc, kind, rng):
-    page = doc[0]
-    chars = [(c["c"], tuple(c["bbox"])) for b in page.get_text("rawdict")["blocks"]
-             for l in b.get("lines", []) for s in l["spans"] for c in s["chars"] if not c["c"].isspace()]
-    dpi, quality = (120, 50) if kind == "lowres" else (150, 65)
-    pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), colorspace=fitz.csGRAY, alpha=False)
-    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+def rasterize(page, kind, rng):
+    img, chars = page.image, page.chars
     if kind == "skew":
         deg = rng.choice([-1.5, 1.5])
         img = img.rotate(-deg, resample=Image.BICUBIC, fillcolor=255)
-        cx, cy = page.rect.width / 2, page.rect.height / 2
+        cx, cy = PAGE_W / 2, PAGE_H / 2
         a = math.radians(deg)
+
         def rot(x, y):
             dx, dy = x - cx, y - cy
             return cx + dx * math.cos(a) - dy * math.sin(a), cy + dx * math.sin(a) + dy * math.cos(a)
         chars = [(c, (lambda pts: (min(q[0] for q in pts), min(q[1] for q in pts),
                                    max(q[0] for q in pts), max(q[1] for q in pts)))(
                      [rot(x, y) for x in (b[0], b[2]) for y in (b[1], b[3])])) for c, b in chars]
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    out = fitz.open()
-    target = out.new_page(width=page.rect.width, height=page.rect.height)
-    target.insert_image(target.rect, stream=buf.getvalue())
-    return out, chars
+    return img, chars
 
 
 def main():
@@ -190,7 +205,9 @@ def main():
     parser.add_argument("--seed", type=int, default=20261020)
     args = parser.parse_args()
     path, index = find_font(args.cjk_font, args.cjk_index)
-    fonts = {"cjk": fitz.Font(fontbuffer=load_face(path, index)), "tiro": fitz.Font("tiro")}
+    face = load_face(path, index)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    import pdfgen
     corpus = args.out / "corpus"
     corpus.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
@@ -199,10 +216,10 @@ def main():
     for kind, count in plan:
         for i in range(count):
             n += 1
-            doc = build(kind, n, rng, fonts)
-            scan, chars = rasterize(doc, kind, rng)
+            image, chars = rasterize(build(kind, n, rng, face), kind, rng)
             name = f"{kind}-{i + 1:02d}"
-            scan.save(corpus / f"{name}.pdf")
+            pdfgen.write_pdf(corpus / f"{name}.pdf", [{"width": PAGE_W, "height": PAGE_H, "image": image,
+                                                       "quality": 50 if kind == "lowres" else 65}])
             refs[name] = {"text": "".join(c for c, _ in chars), "chars": chars}
     (args.out / "reference.json").write_text(json.dumps(refs, ensure_ascii=False))
     print(len(refs), "pages from", path, "face", index)

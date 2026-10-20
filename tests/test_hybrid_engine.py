@@ -1,12 +1,14 @@
+import io
 import random
 
-import pymupdf as fitz
+from PIL import Image
 import pytest
 
 from engine import Block, OcrError, create_engine
 import hybrid_engine
 from hybrid_engine import HybridEngine, merge
 from pdf_layer import process_pdf
+from pdfutil import display_size, find, open_pdf, text
 
 
 W = H = 1000  # page image pixels; boxes below are written in pixels
@@ -220,20 +222,22 @@ def test_hybrid_text_layer_passes_extraction_check(scan_factory, tmp_path, align
     report = process_pdf(source, output, HybridEngine(unlimited, rapid).recognize)
     assert report.pages_ocr_added == 1
     assert unlimited.images == rapid.images and len(unlimited.images) == 1
-    with fitz.open(output) as doc:
+    with open_pdf(output) as doc:
         page = doc[0]
-        assert page.get_text().split() == "Searchable document 12345 繁體中文文件測試 简体中文文档测试".split()
+        assert text(page).split() == "Searchable document 12345 繁體中文文件測試 简体中文文档测试".split()
+        width, height = display_size(page)
         for b in truth[:2]:
-            found = page.search_for(b.text)
+            found = find(page, b.text)
             assert len(found) == 1
-            expected = fitz.Rect(b.box[0] * page.rect.width, b.box[1] * page.rect.height,
-                                 b.box[2] * page.rect.width, b.box[3] * page.rect.height)
+            expected = (b.box[0] * width, b.box[1] * height, b.box[2] * width, b.box[3] * height)
             assert all(abs(a - e) < 1.5 for a, e in zip(found[0], expected)), b.text
-        assert page.search_for(truth[2].text)
+        assert find(page, truth[2].text)
 
 
 def tiny_png():
-    return fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 4, 3), False).tobytes("png")
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 3), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 @pytest.mark.parametrize("failing, code", [("unlimited", "model_unavailable"),

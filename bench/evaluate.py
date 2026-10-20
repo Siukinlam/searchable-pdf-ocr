@@ -15,9 +15,10 @@ import statistics
 import unicodedata
 from collections import Counter
 from pathlib import Path
+import sys
 
-import pymupdf as fitz
 from PIL import Image, ImageDraw
+import pypdfium2 as pdfium
 from rapidfuzz.distance import Levenshtein
 
 LEADERS = set(".…．·‧・")
@@ -37,9 +38,16 @@ def clean(chars):
 
 
 def layer_chars(page):
-    rm = page.rotation_matrix
-    return [(c["c"], tuple(fitz.Rect(c["bbox"]) * rm)) for b in page.get_text("rawdict")["blocks"]
-            for l in b.get("lines", []) for s in l["spans"] for c in s["chars"]]
+    """Extracted characters with PDFium's loose (font-based) boxes in
+    displayed points, the boxes a viewer highlights on selection."""
+    from pdf_layer import PageSpace
+    space = PageSpace(page)
+    textpage = page.get_textpage()
+    try:
+        return [(textpage.get_text_range(i, 1), space.rect_to_display(*textpage.get_charbox(i, loose=True)))
+                for i in range(textpage.count_chars())]
+    finally:
+        textpage.close()
 
 
 def score(ref_chars, hyp_chars):
@@ -67,8 +75,7 @@ def score(ref_chars, hyp_chars):
 
 def overlay(src, layers, path):
     zoom = 2
-    pix = src.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    base = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    base = src.render(scale=zoom).to_pil().convert("RGB")
     panels = []
     for label, chars, color in layers:
         im = base.copy()
@@ -87,6 +94,7 @@ def overlay(src, layers, path):
 
 
 def main():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     parser = argparse.ArgumentParser()
     parser.add_argument("out", type=Path)
     parser.add_argument("engines", nargs="+")
@@ -104,7 +112,7 @@ def main():
             if t.get("status") != "done":
                 pages[page] = {"status": t.get("status", "missing")}
                 continue
-            with fitz.open(folder / f"{page}.pdf") as doc:
+            with pdfium.PdfDocument(folder / f"{page}.pdf") as doc:
                 pages[page] = {"status": "done", "recognize_s": t["recognize_s"], "total_s": t["total_s"],
                                **score(ref["chars"], layer_chars(doc[0]))}
         metrics[name] = pages
@@ -135,12 +143,12 @@ def main():
     colors = [(220, 30, 30), (30, 60, 220), (200, 120, 0), (120, 0, 160)]
     for page in args.overlays:
         corpus = args.out / "corpus" / f"{page}.pdf"
-        with fitz.open(corpus) as src:
+        with pdfium.PdfDocument(corpus) as src:
             layers = [("reference", [tuple(c) for c in refs[page]["chars"]], (0, 150, 0))]
             for (name, folder), color in zip(engines.items(), colors):
                 f = Path(folder) / f"{page}.pdf"
                 if f.exists():
-                    with fitz.open(f) as doc:
+                    with pdfium.PdfDocument(f) as doc:
                         layers.append((name, layer_chars(doc[0]), color))
             (args.out / "overlays").mkdir(exist_ok=True)
             overlay(src[0], layers, args.out / "overlays" / f"{page}.png")

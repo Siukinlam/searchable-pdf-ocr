@@ -1,4 +1,4 @@
-import pymupdf as fitz
+from pdfutil import display_size, find, open_pdf, pixels, text
 import pytest
 
 from engine import OcrError, UnlimitedOCR, create_engine
@@ -115,22 +115,25 @@ def test_real_rapidocr_line_geometry_on_synthetic_scan(scan_factory, tmp_path, r
     report = process_pdf(source, output, real_engine.recognize)
     assert report.pages_ocr_added == report.pages_native_text == 1
     assert output.read_bytes().startswith(source.read_bytes())
-    with fitz.open(source) as before, fitz.open(output) as after:
+    with open_pdf(source) as before, open_pdf(output) as after:
         page = after[0]
-        assert page.get_pixmap().samples == before[0].get_pixmap().samples
+        assert pixels(page) == pixels(before[0])
+        width, height = display_size(page)
         for block in truth:
-            assert block.text in page.get_text()
-            matches = page.search_for(block.text)
+            assert block.text in text(page)
+            matches = find(page, block.text)
             assert matches
-            actual = fitz.Rect()
-            for rect in matches:
-                actual |= rect * page.rotation_matrix
-            expected = fitz.Rect(block.box[0] * page.rect.width, block.box[1] * page.rect.height,
-                                 block.box[2] * page.rect.width, block.box[3] * page.rect.height)
+            x0, y0, x1, y1 = (block.box[0] * width, block.box[1] * height,
+                              block.box[2] * width, block.box[3] * height)
             # Line-grounded text lands on the scanned glyphs, not just
-            # somewhere inside a model block.
-            assert abs(actual.x0 - expected.x0) < 5 and abs(actual.x1 - expected.x1) < 5
-            assert abs((actual.y0 + actual.y1) - (expected.y0 + expected.y1)) / 2 < 4
+            # somewhere inside a model block: ends along the line, center
+            # across it (lines run vertically on 90/270-degree pages).
+            found = matches[0]
+            along, across = (0, 1) if x1 - x0 >= y1 - y0 else (1, 0)
+            expected = (x0, y0, x1, y1)
+            assert abs(found[along] - expected[along]) < 5
+            assert abs(found[along + 2] - expected[along + 2]) < 5
+            assert abs((found[across] + found[across + 2]) - (expected[across] + expected[across + 2])) / 2 < 4
 
 
 def test_direction_classifier_needs_a_better_reading_to_turn_a_line(monkeypatch):

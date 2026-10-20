@@ -1,9 +1,11 @@
+import io
 import json
 
-import pymupdf as fitz
+from PIL import Image
 import pytest
 
 from engine import Block
+from pdfutil import chars, open_pdf, text
 from hybrid_engine import HybridEngine, merge
 import recordings
 
@@ -26,7 +28,9 @@ def engines(truth):
 
 
 def test_page_record_round_trips_through_json():
-    png = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 30), False).tobytes("png")
+    buffer = io.BytesIO()
+    Image.new("RGB", (40, 30), "white").save(buffer, format="PNG")
+    png = buffer.getvalue()
     blocks = [Block("區塊", (0.1, 0.2, 0.5, 0.4)),
               Block("AB", (0.1, 0.1, 0.3, 0.2), quad_of((0.1, 0.1, 0.3, 0.2)),
                     (("A", (0.1, 0.1, 0.2, 0.2)), ("B", (0.2, 0.1, 0.3, 0.2))))]
@@ -76,9 +80,9 @@ def test_recorded_engines_replay_to_the_live_hybrid_result(scan_factory, tmp_pat
     live = tmp_path / "live.pdf"
     from pdf_layer import process_pdf
     process_pdf(pdfs / "scan.pdf", live, HybridEngine(Engine(unlimited), Engine(rapid)).recognize)
-    with fitz.open(tmp_path / "out" / "scan.pdf") as replayed, fitz.open(live) as direct:
-        assert replayed[0].get_text("rawdict") == direct[0].get_text("rawdict")
-        assert "繁體中文文件測試" in replayed[0].get_text()
+    with open_pdf(tmp_path / "out" / "scan.pdf") as replayed, open_pdf(live) as direct:
+        assert chars(replayed[0]) == chars(direct[0])
+        assert "繁體中文文件測試" in text(replayed[0])
 
 
 def test_replay_refuses_a_different_page_image(scan_factory, tmp_path):

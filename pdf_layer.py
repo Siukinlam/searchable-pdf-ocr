@@ -1,12 +1,27 @@
-"""Preserve the PDF and append Unicode text with PDF render mode 3."""
+"""Preserve the PDF and append an invisible Unicode text layer (render mode 3).
+
+Pages are rendered and the text layer is written with PDFium (pypdfium2). The
+text uses a font generated per document: one empty glyph per character that
+occurs, with advance widths and a Unicode cmap, so extraction, search and
+selection work while nothing is drawn and no font program is embedded beyond a
+few kilobytes. The update is saved incrementally after the original bytes.
+"""
+from collections import Counter
+import ctypes
 from dataclasses import dataclass, asdict
 import hashlib
+import io
 import math
 from pathlib import Path
+import re
 import shutil
 import unicodedata
+import zlib
 
-import pymupdf as fitz
+from fontTools.fontBuilder import FontBuilder
+from fontTools.pens.ttGlyphPen import TTGlyphPen
+import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 
 from engine import Block, OcrError
 
@@ -23,44 +38,200 @@ class Report:
         return asdict(self)
 
 
+class GlyphLessFont:
+    """Advance widths and font program for invisible OCR text.
+
+    Every character gets its own glyph so PDFium's generated ToUnicode map
+    (CID = glyph ID) maps it back to exactly that character. Each glyph is a
+    rectangle filling its cell: render mode 3 never paints it, and PDFium
+    skips text whose glyphs have empty bounds (a one-character run would
+    vanish from extraction) while it derives character boxes from them.
+    Widths only approximate a proportional font; line placement stretches
+    each run to the detected geometry.
+    """
+    units = 1000
+    ascender = 0.88
+    descender = -0.12
+
+    @staticmethod
+    def width(char):
+        if unicodedata.east_asian_width(char) in {"W", "F"}:
+            return 1000
+        if unicodedata.category(char).startswith("M"):
+            return 0
+        if char == " ":
+            return 280
+        if char in "ijlI|.,:;'!`":
+            return 280
+        if char in "frt()[]{}-/\\\"":
+            return 350
+        if char in "mwMW@%":
+            return 830
+        if char.isupper() or char.isdigit():
+            return 620
+        return 520
+
+    def text_length(self, text, fontsize=1.0):
+        return sum(self.width(char) for char in text) * fontsize / self.units
+
+    @classmethod
+    def program(cls, chars) -> bytes:
+        codes = sorted({ord(c) for c in chars} | {0x20})
+        names = {code: f"u{code:04X}" for code in codes}
+        builder = FontBuilder(cls.units, isTTF=True)
+        builder.setupGlyphOrder([".notdef"] + [names[c] for c in codes])
+        builder.setupCharacterMap(names)
+        ascent, descent = round(cls.ascender * cls.units), round(cls.descender * cls.units)
+
+        def cell(advance):
+            pen = TTGlyphPen(None)
+            right = max(advance, 1)
+            pen.moveTo((0, descent))
+            pen.lineTo((0, ascent))
+            pen.lineTo((right, ascent))
+            pen.lineTo((right, descent))
+            pen.closePath()
+            return pen.glyph()
+        cells = {}
+        glyphs = {".notdef": TTGlyphPen(None).glyph()}
+        for code in codes:
+            advance = cls.width(chr(code))
+            if advance not in cells:
+                cells[advance] = cell(advance)
+            glyphs[names[code]] = cells[advance]
+        builder.setupGlyf(glyphs)
+        builder.setupHorizontalMetrics({".notdef": (500, 0),
+                                        **{names[c]: (cls.width(chr(c)), 0) for c in codes}})
+        builder.setupHorizontalHeader(ascent=ascent, descent=descent)
+        builder.setupNameTable({"familyName": "GlyphLessOCR", "styleName": "Regular"})
+        builder.setupOS2(sTypoAscender=ascent, sTypoDescender=descent,
+                         usWinAscent=ascent, usWinDescent=-descent)
+        builder.setupPost()
+        buffer = io.BytesIO()
+        builder.save(buffer)
+        return buffer.getvalue()
+
+
+def _supported(char):
+    # Control characters, surrogates and unassigned code points cannot
+    # round-trip through a PDF text string and ToUnicode map, and PDFium drops
+    # characters outside the Basic Multilingual Plane from text objects.
+    category = unicodedata.category(char)
+    return ord(char) <= 0xFFFF and not (category in {"Cc", "Cs", "Cn"} and not char.isspace())
+
+
+def _characters(text):
+    # PDFium may extract a base letter and combining mark as one composed
+    # character; compare canonical compositions.
+    return Counter(unicodedata.normalize("NFC", "".join(text.split())))
+
+
+def page_text(page) -> str:
+    textpage = page.get_textpage()
+    try:
+        return textpage.get_text_range()
+    finally:
+        textpage.close()
+
+
 def has_text(page):
-    return bool(page.get_text().strip())
+    return bool(page_text(page).strip())
 
 
-def validate(doc, max_pages=200):
-    if not doc.is_pdf or doc.needs_pass or doc.is_encrypted:
-        raise OcrError("encrypted_or_invalid_pdf")
-    if not 0 < doc.page_count <= max_pages:
-        raise OcrError("page_limit_exceeded")
-    # Reject signed/certified forms as well as signature dictionaries not
-    # reachable via widgets. Never silently invalidate a signature.
-    if doc.get_sigflags() > 0:
-        raise OcrError("signed_pdf_not_supported")
-    for xref in range(1, doc.xref_length()):
-        if doc.xref_get_key(xref, "Type")[1] == "/Sig" or \
-           doc.xref_get_key(xref, "FT")[1] == "/Sig" or \
-           doc.xref_get_key(xref, "ByteRange")[0] != "null":
+class PageSpace:
+    """Displayed page coordinates (points, origin top-left, y down, after
+    /Rotate and the crop box) to and from unrotated PDF user space."""
+
+    def __init__(self, page):
+        self.left, self.bottom, self.right, self.top = page.get_cropbox()
+        self.rotation = page.get_rotation() % 360
+        w, h = self.right - self.left, self.top - self.bottom
+        self.width, self.height = (h, w) if self.rotation in {90, 270} else (w, h)
+
+    def to_user(self, x, y):
+        r = self.rotation
+        if r == 90:
+            return self.left + y, self.bottom + x
+        if r == 180:
+            return self.right - x, self.bottom + y
+        if r == 270:
+            return self.right - y, self.top - x
+        return self.left + x, self.top - y
+
+    def vector(self, dx, dy):
+        x0, y0 = self.to_user(0, 0)
+        x1, y1 = self.to_user(dx, dy)
+        return x1 - x0, y1 - y0
+
+    def to_display(self, x, y):
+        r = self.rotation
+        if r == 90:
+            return y - self.bottom, x - self.left
+        if r == 180:
+            return self.right - x, y - self.bottom
+        if r == 270:
+            return self.top - y, self.right - x
+        return x - self.left, self.top - y
+
+    def rect_to_display(self, left, bottom, right, top):
+        xs, ys = zip(*(self.to_display(x, y) for x in (left, right) for y in (bottom, top)))
+        return min(xs), min(ys), max(xs), max(ys)
+
+
+_SIGNATURE_MARKERS = (b"/ByteRange", b"/DocMDP", b"/UR3", b"/Type/Sig", b"/Type /Sig",
+                      b"/FT/Sig", b"/FT /Sig")
+
+
+def _has_signature_marker(data: bytes) -> bool:
+    # PDFium only counts signature fields. Certification (/Perms /DocMDP) and
+    # orphaned signature dictionaries can sit in plain objects or in
+    # compressed object streams, so scan both. A false positive only rejects.
+    if any(marker in data for marker in _SIGNATURE_MARKERS):
+        return True
+    for match in re.finditer(rb"stream\r?\n", data):
+        end = data.find(b"endstream", match.end())
+        if end < 0:
+            break
+        try:
+            chunk = zlib.decompressobj().decompress(data[match.end():end], 4 * 1024 * 1024)
+        except zlib.error:
+            continue
+        if b"/ObjStm" in data[max(0, match.start() - 512):match.start()] and \
+           any(marker in chunk for marker in _SIGNATURE_MARKERS):
+            return True
+    return False
+
+
+def _well_formed_tail(data: bytes) -> bool:
+    # An incremental update appends after the last cross-reference section;
+    # a file whose own startxref is wrong only opens after repair, and an
+    # update chained to it would not be readable without repair either.
+    match = re.search(rb"startxref\s+(\d+)\s+%%EOF\s*$", data[-2048:])
+    if not match:
+        return False
+    offset = int(match.group(1))
+    head = data[offset:offset + 64]
+    return head.startswith(b"xref") or re.match(rb"\d+\s+\d+\s+obj", head) is not None
+
+
+def validate(source: Path, max_pages=200):
+    data = Path(source).read_bytes()
+    try:
+        doc = pdfium.PdfDocument(data)
+    except pdfium.PdfiumError:
+        raise OcrError("encrypted_or_invalid_pdf") from None
+    try:
+        if pdfium_c.FPDF_GetSecurityHandlerRevision(doc.raw) != -1:
+            raise OcrError("encrypted_or_invalid_pdf")
+        if not 0 < len(doc) <= max_pages:
+            raise OcrError("page_limit_exceeded")
+        # Never silently invalidate a signature or certification.
+        if pdfium_c.FPDF_GetSignatureCount(doc.raw) > 0 or _has_signature_marker(data):
             raise OcrError("signed_pdf_not_supported")
-    if not doc.can_save_incrementally():
-        raise OcrError("pdf_requires_repair")
-
-
-def _add_line(page, text, box, font, fontname):
-    # Work in the displayed-page space used by the model, then apply the
-    # inverse /Rotate transform to the insertion origin and scaling axes.
-    rect = fitz.Rect(box)
-    size = rect.height / (font.ascender - font.descender)
-    width = font.text_length(text, fontsize=size)
-    if size <= 0 or width <= 0:
-        return
-    origin = fitz.Point(rect.x0, rect.y0 + size * font.ascender)
-    origin = origin * page.derotation_matrix
-    scale = rect.width / width
-    # Scaling is in unrotated axes; horizontal displayed text maps to the
-    # PDF's Y axis on 90/270-degree pages.
-    morph = fitz.Matrix(1, scale) if page.rotation in {90, 270} else fitz.Matrix(scale, 1)
-    page.insert_text(origin, text, fontname=fontname, fontsize=size,
-                     render_mode=3, rotate=page.rotation, morph=(origin, morph), overlay=True)
+        if not _well_formed_tail(data):
+            raise OcrError("pdf_requires_repair")
+    finally:
+        doc.close()
 
 
 def _fit_lines(lines, width, height, font):
@@ -135,23 +306,6 @@ def _fit_lines(lines, width, height, font):
     return wrap(width / lower), lower * font_height
 
 
-def _place_run(page, text, origin, direction, scale, size, fontname):
-    # origin is the baseline start and direction the unit text direction, both
-    # in the displayed-page space used by the OCR image. Stretch the run along
-    # its own axis (conjugated by /Rotate, as in _add_line), then turn it to
-    # follow skew or a vertical column. Morph angles run opposite to
-    # displayed y-down angles.
-    if size <= 0 or scale <= 0:
-        return
-    angle = math.degrees(math.atan2(direction[1], direction[0]))
-    rotation = fitz.Matrix(page.rotation_matrix)
-    rotation.e = rotation.f = 0
-    morph = rotation * fitz.Matrix(scale, 1) * ~rotation * fitz.Matrix(-angle)
-    origin = fitz.Point(origin) * page.derotation_matrix
-    page.insert_text(origin, text, fontname=fontname, fontsize=size,
-                     render_mode=3, rotate=page.rotation, morph=(origin, morph), overlay=True)
-
-
 def _runs(text, starts, ends, advance, tolerance):
     """Split a line into (text, start, scale) runs wherever the font's
     proportional layout misses a detected character start, or a word end, by
@@ -203,8 +357,59 @@ def _runs(text, starts, ends, advance, tolerance):
     return runs
 
 
-def _add_grounded_line(page, block, font, fontname):
-    w, h = page.rect.width, page.rect.height
+class TextLayer:
+    """Invisible text objects on one document, all in one generated font."""
+
+    def __init__(self, doc, chars):
+        self.doc = doc
+        self.metrics = GlyphLessFont()
+        program = GlyphLessFont.program(chars)
+        self._buffer = (ctypes.c_uint8 * len(program)).from_buffer_copy(program)
+        self.font = pdfium_c.FPDFText_LoadFont(doc.raw, self._buffer, len(program),
+                                               pdfium_c.FPDF_FONT_TRUETYPE, True)
+        if not self.font:
+            raise OcrError("output_validation_failed")
+
+    def close(self):
+        pdfium_c.FPDFFont_Close(self.font)
+
+    def place(self, page, space, text, origin, direction, scale, size):
+        """One run: origin is the baseline start and direction the unit text
+        direction, both in displayed points; scale stretches the advances."""
+        if not text or size <= 0 or scale <= 0:
+            return
+        obj = pdfium_c.FPDFPageObj_CreateTextObj(self.doc.raw, self.font, ctypes.c_float(size))
+        if not obj:
+            raise OcrError("output_validation_failed")
+        encoded = (text + "\0").encode("utf-16-le")
+        buffer = ctypes.create_string_buffer(encoded, len(encoded))
+        if not pdfium_c.FPDFText_SetText(obj, ctypes.cast(buffer, ctypes.POINTER(pdfium_c.FPDF_WCHAR))):
+            pdfium_c.FPDFPageObj_Destroy(obj)
+            raise OcrError("unsupported_ocr_glyph")
+        pdfium_c.FPDFTextObj_SetTextRenderMode(obj, pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE)
+        # Text space x follows the reading direction, y the glyph's up side;
+        # both are mapped from displayed (y-down) into user space.
+        ux, uy = space.vector(*direction)
+        vx, vy = space.vector(direction[1], -direction[0])
+        ox, oy = space.to_user(*origin)
+        pdfium_c.FPDFPageObj_Transform(obj, ux * scale, uy * scale, vx, vy, ox, oy)
+        pdfium_c.FPDFPage_InsertObject(page.raw, obj)
+
+
+def _add_line(layer, page, space, text, box):
+    x0, y0, x1, y1 = box
+    font = layer.metrics
+    size = (y1 - y0) / (font.ascender - font.descender)
+    width = font.text_length(text, fontsize=size)
+    if size <= 0 or width <= 0:
+        return
+    layer.place(page, space, text, (x0, y0 + size * font.ascender), (1.0, 0.0),
+                (x1 - x0) / width, size)
+
+
+def _add_grounded_line(layer, page, space, block):
+    w, h = space.width, space.height
+    font = layer.metrics
     (ax, ay), (bx, by), _, (dx, dy) = ((x * w, y * h) for x, y in block.quad)
     length, thickness = math.hypot(bx - ax, by - ay), math.hypot(dx - ax, dy - ay)
     if length <= 0 or thickness <= 0:
@@ -215,7 +420,10 @@ def _add_grounded_line(page, block, font, fontname):
     base = (ax + n[0] * size * font.ascender, ay + n[1] * size * font.ascender)
     natural = font.text_length(block.text, fontsize=size)
     runs = [(block.text, 0.0, length / natural)] if natural > 0 else []
-    if block.chars:
+    # PDFium orders the text objects of a line by their displayed position.
+    # On a line shown upside down that reverses split runs ("t 12345
+    # Searchable documen"), so such a line stays one run on its line box.
+    if block.chars and u[0] > -0.5:
         # Project each character box onto the reading direction.
         starts, ends = [], []
         for _, (x0, y0, x1, y1) in block.chars:
@@ -225,100 +433,109 @@ def _add_grounded_line(page, block, font, fontname):
             ends.append(min(length, max(along)))
         if all(b > a for a, b in zip(starts, ends)) and \
            all(b >= a for a, b in zip(starts, starts[1:])):
-            cache = {}
-            def advance(unit):
-                if unit not in cache:
-                    cache[unit] = font.text_length(unit, fontsize=size)
-                return cache[unit]
-            runs = _runs(block.text, starts, ends, advance, 0.2 * thickness)
+            runs = _runs(block.text, starts, ends,
+                         lambda unit: font.text_length(unit, fontsize=size), 0.2 * thickness)
     for run, start, scale in runs:
-        _place_run(page, run, (base[0] + u[0] * start, base[1] + u[1] * start), u,
-                   scale, size, fontname)
+        layer.place(page, space, run, (base[0] + u[0] * start, base[1] + u[1] * start), u,
+                    scale, size)
 
 
-def add_blocks(page, blocks: list[Block]):
-    font = fitz.Font("cjk")
-    # Resource names belong to the source PDF. Reusing an existing name makes
-    # PyMuPDF silently keep that font, even if its glyph mapping differs.
-    existing = {item[4] for item in page.get_fonts(full=True)}
-    fontname = "OCRUnicode"
-    suffix = 0
-    while fontname in existing:
-        suffix += 1
-        fontname = f"OCRUnicode{suffix}"
-    if blocks:
-        page.insert_font(fontname=fontname, fontbuffer=font.buffer)
+def add_blocks(layer, page, blocks: list[Block]):
+    space = PageSpace(page)
     for block in blocks:
-        if any(not font.has_glyph(ord(char)) for char in block.text if not char.isspace()):
+        if any(not _supported(char) for char in block.text):
             raise OcrError("unsupported_ocr_glyph")
         if block.quad is not None:
-            _add_grounded_line(page, block, font, fontname)
+            _add_grounded_line(layer, page, space, block)
             continue
         lines = [line for line in block.text.splitlines() if line.strip()]
         if not lines:
             continue
         x0, y0, x1, y1 = block.box
-        rect = page.rect
-        x0, x1 = x0 * rect.width, x1 * rect.width
-        y0, y1 = y0 * rect.height, y1 * rect.height
-        lines, line_height = _fit_lines(lines, x1 - x0, y1 - y0, font)
+        x0, x1 = x0 * space.width, x1 * space.width
+        y0, y1 = y0 * space.height, y1 * space.height
+        lines, line_height = _fit_lines(lines, x1 - x0, y1 - y0, layer.metrics)
         for n, line in enumerate(lines):
-            _add_line(page, line, (x0, y0 + n * line_height,
-                                  x1, y0 + (n + 1) * line_height), font, fontname)
+            _add_line(layer, page, space, line, (x0, y0 + n * line_height,
+                                                 x1, y0 + (n + 1) * line_height))
+    if not pdfium_c.FPDFPage_GenerateContent(page.raw):
+        raise OcrError("output_validation_failed")
     # A nonempty ASCII fragment is not evidence that every recognized glyph
-    # survived. Check the inserted Unicode content before accepting the page.
-    expected = "".join("".join(block.text.split()) for block in blocks)
-    if expected != "".join(page.get_text().split()):
+    # survived. Every recognized character must be extractable exactly once.
+    # PDFium orders extracted text by its own line analysis (a paragraph
+    # number may follow its line), so the order is not compared.
+    if _characters("".join(block.text for block in blocks)) != _characters(page_text(page)):
         raise OcrError("output_text_mismatch")
+
+
+def render_page(page, dpi=200, max_pixels=20_000_000) -> bytes:
+    """The displayed page (rotation, crop box, annotations) as an RGB PNG."""
+    space = PageSpace(page)
+    scale = min(dpi / 72, math.sqrt(max_pixels / max(1.0, space.width * space.height)))
+    if scale <= 0 or not math.isfinite(scale):
+        raise OcrError("invalid_page_geometry")
+    image = page.render(scale=scale, draw_annots=True, rev_byteorder=True).to_pil().convert("RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _digests(doc):
+    return [hashlib.sha256(page_text(doc[i]).encode("utf-8")).digest() for i in range(len(doc))]
 
 
 def process_pdf(source: Path, result: Path, recognize, progress=lambda _: None,
                 max_pages=200, dpi=200, max_pixels=20_000_000) -> Report:
+    source, result = Path(source), Path(result)
     # Preflight occurs before copy or inference. Keep source bytes untouched.
     try:
-        with fitz.open(source) as doc:
-            validate(doc, max_pages)
+        validate(source, max_pages)
     except OcrError:
         raise
     except Exception:
         raise OcrError("invalid_pdf") from None
-    shutil.copyfile(source, result)
     report = Report()
-    text_digests = []
     try:
-        with fitz.open(result) as doc:
-            report.pages_total = doc.page_count
+        recognized = {}
+        with pdfium.PdfDocument(source) as doc:
+            report.pages_total = len(doc)
             progress(report.public())
-            for page in doc:
+            for index in range(len(doc)):
+                page = doc[index]
                 if has_text(page):
                     report.pages_native_text += 1
-                    report.pages_with_text += 1
                 else:
-                    scale = min(dpi / 72, math.sqrt(max_pixels / max(1, page.rect.get_area())))
-                    if scale <= 0 or not math.isfinite(scale):
-                        raise OcrError("invalid_page_geometry")
-                    pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False,
-                                             colorspace=fitz.csRGB, annots=True)
-                    blocks = recognize(pixmap.tobytes("png"))
-                    add_blocks(page, blocks)
-                    if has_text(page):
-                        report.pages_with_text += 1
-                        report.pages_ocr_added += 1
-                    else:
-                        report.pages_without_text += 1
-                text_digests.append(hashlib.sha256(page.get_text().encode("utf-8")).digest())
-                progress({**report.public(), "progress": round((page.number + 1) * 95 / doc.page_count, 1)})
-            if report.pages_with_text == 0:
-                raise OcrError("no_text_recognized")
-            if report.pages_ocr_added:
-                # Incremental save retains original source bytes, streams,
-                # images, metadata, bookmarks and annotations.
-                doc.saveIncr()
-        with fitz.open(result) as reloaded:
-            if reloaded.page_count != report.pages_total or \
-               sum(has_text(page) for page in reloaded) != report.pages_with_text or \
-               [hashlib.sha256(page.get_text().encode("utf-8")).digest() for page in reloaded] != text_digests:
+                    recognized[index] = recognize(render_page(page, dpi, max_pixels))
+                progress({**report.public(),
+                          "progress": round((index + 1) * 90 / report.pages_total, 1)})
+        chars = {char for blocks in recognized.values() for block in blocks for char in block.text}
+        written = {index for index, blocks in recognized.items()
+                   if "".join("".join(b.text.split()) for b in blocks)}
+        report.pages_with_text = report.pages_native_text + len(written)
+        report.pages_ocr_added = len(written)
+        report.pages_without_text = report.pages_total - report.pages_with_text
+        if report.pages_with_text == 0:
+            raise OcrError("no_text_recognized")
+        if not written:
+            shutil.copyfile(source, result)
+        else:
+            with pdfium.PdfDocument(source) as doc:
+                layer = TextLayer(doc, chars)
+                try:
+                    for index in sorted(written):
+                        add_blocks(layer, doc[index], recognized[index])
+                    expected = _digests(doc)
+                    # Incremental save keeps the original bytes as the prefix,
+                    # with images, metadata, bookmarks and annotations.
+                    doc.save(result, flags=pdfium_c.FPDF_INCREMENTAL)
+                finally:
+                    layer.close()
+            if not result.read_bytes().startswith(source.read_bytes()):
                 raise OcrError("output_validation_failed")
+            with pdfium.PdfDocument(result) as reloaded:
+                if len(reloaded) != report.pages_total or _digests(reloaded) != expected:
+                    raise OcrError("output_validation_failed")
+        progress({**report.public(), "progress": 95})
         return report
     except Exception:
         result.unlink(missing_ok=True)

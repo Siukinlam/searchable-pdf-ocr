@@ -2,50 +2,60 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pymupdf as fitz
+from PIL import Image, ImageDraw, ImageFont
 import pytest
 
 from engine import Block
+from pdf_layer import PageSpace
+import pdfgen
+from pdfutil import open_pdf
+
+FONT = Path(__file__).with_name("fixtures") / "DroidSansFallback-subset.ttf"
+LINES = ["Searchable document 12345", "繁體中文文件測試", "简体中文文档测试"]
+CROP = (25, 20, 575, 780)  # x0, y0, x1, y1 from the top-left of a 600x800 page
+
+
+def draw_scan(lines, width=600, height=800, zoom=2, size=20, origin=(65, 100), step=55, rect=True):
+    """A rasterized page and each line's box in points (top-left origin): the
+    advance width by the font's ascent and descent, as a text extractor
+    reports a line, not the tighter ink bounds."""
+    image = Image.new("RGB", (width * zoom, height * zoom), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype(str(FONT), size * zoom)
+    ascent, descent = font.getmetrics()
+    boxes = []
+    for index, line in enumerate(lines):
+        x, y = origin[0] * zoom, (origin[1] + index * step) * zoom
+        draw.text((x, y), line, font=font, fill="black", anchor="ls")
+        boxes.append((x / zoom, (y - ascent) / zoom, (x + font.getlength(line)) / zoom, (y + descent) / zoom))
+    if rect:
+        draw.rectangle((40 * zoom, 40 * zoom, 560 * zoom, 270 * zoom), outline=(51, 102, 178), width=2)
+    return image, boxes
 
 
 @pytest.fixture
 def scan_factory(tmp_path):
     def create(name="scan", rotation=0, native=False, blank=False, crop=False):
-        lines = ["Searchable document 12345", "繁體中文文件測試", "简体中文文档测试"]
-        original = fitz.open()
-        page = original.new_page(width=600, height=800)
-        font = fitz.Font("cjk")
-        page.insert_font(fontname="CorpusFont", fontbuffer=font.buffer)
-        if not blank:
-            for index, line in enumerate(lines):
-                page.insert_text((65, 100 + index * 55), line,
-                                 fontsize=20, fontname="CorpusFont")
-        page.draw_rect((40, 40, 560, 270), color=(0.2, 0.4, 0.7), width=1)
-        # Rasterize content so the new test input genuinely has no text layer.
-        image = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png")
-        boxes = [fitz.Rect(line["bbox"]) for block in page.get_text("dict")["blocks"]
-                 if block["type"] == 0 for line in block["lines"]]
-        doc = fitz.open()
-        scanned = doc.new_page(width=600, height=800)
-        scanned.insert_image(scanned.rect, stream=image)
+        image, boxes = draw_scan([] if blank else LINES)
+        page = {"width": 600, "height": 800, "image": image, "rotate": rotation}
         if crop:
-            scanned.set_cropbox(fitz.Rect(25, 20, 575, 780))
-            boxes = [box + (-25, -20, -25, -20) for box in boxes]
-        scanned.set_rotation(rotation)
-        blocks = []
-        for line, box in zip(lines, boxes):
-            rect = box * scanned.rotation_matrix
-            blocks.append(Block(line, (rect.x0 / scanned.rect.width, rect.y0 / scanned.rect.height,
-                                       rect.x1 / scanned.rect.width, rect.y1 / scanned.rect.height)))
+            page["crop"] = CROP
+        pages = [page]
         if native:
-            p = doc.new_page(width=600, height=800)
-            p.insert_text((80, 100), "Existing native text stays exact.")
-        doc.set_metadata({"title": "Synthetic OCR corpus", "author": "Synthetic QA"})
-        doc.set_toc([[1, "Synthetic bookmark", 1]])
+            pages.append({"width": 600, "height": 800, "text": [(80, 100, "Existing native text stays exact.")]})
         path = tmp_path / (name + ".pdf")
-        doc.save(path)
-        doc.close()
-        original.close()
+        pdfgen.write_pdf(path, pages, title="Synthetic OCR corpus", author="Synthetic QA",
+                         outline="Synthetic bookmark")
+        # Ground truth in normalized displayed coordinates of the scanned page.
+        with open_pdf(path) as doc:
+            space = PageSpace(doc[0])
+            blocks = []
+            for line, (x0, y0, x1, y1) in zip(LINES, boxes):
+                corners = [space.to_display(x, 800 - y) for x in (x0, x1) for y in (y0, y1)]
+                xs, ys = [c[0] for c in corners], [c[1] for c in corners]
+                blocks.append(Block(line, (min(xs) / space.width, min(ys) / space.height,
+                                           max(xs) / space.width, max(ys) / space.height)))
         return path, blocks
     return create
